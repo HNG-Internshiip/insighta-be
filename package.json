@@ -1,41 +1,36 @@
 {
-  "name": "insighta-backend",
-  "version": "3.0.0",
-  "main": "dist/src/app.js",
-  "scripts": {
-    "build": "tsc",
-    "start": "node dist/src/app.js",
-    "dev":   "ts-node-dev --respawn --transpile-only src/app.ts",
-    "seed":  "node scripts/seed.js",
-    "lint":  "eslint 'src/**/*.ts'",
-    "test":  "echo 'no tests yet' && exit 0"
-  },
-  "dependencies": {
-    "axios":           "^1.6.8",
-    "cookie-parser":   "^1.4.6",
-    "cors":            "^2.8.5",
-    "csurf":           "^1.11.0",
-    "dotenv":          "^16.4.5",
-    "express":         "^4.19.2",
-    "express-rate-limit": "^7.2.0",
-    "jsonwebtoken":    "^9.0.2",
-    "pg":              "^8.11.5",
-    "serverless-http": "^3.2.0",
-    "uuid":            "^9.0.1"
-  },
-  "devDependencies": {
-    "@netlify/functions":  "^2.6.0",
-    "@types/aws-lambda":   "^8.10.137",
-    "@types/cookie-parser":"^1.4.7",
-    "@types/cors":         "^2.8.17",
-    "@types/csurf":        "^1.11.5",
-    "@types/express":      "^4.17.21",
-    "@types/jsonwebtoken": "^9.0.6",
-    "@types/node":         "^20.12.7",
-    "@types/pg":           "^8.11.5",
-    "@types/uuid":         "^9.0.8",
-    "ts-node":             "^10.9.2",
-    "ts-node-dev":         "^2.0.0",
-    "typescript":          "^5.4.5"
-  }
+    "name": "insighta-portal",
+    "version": "3.0.0",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "dev": "vite",
+        "build": "tsc && vite build",
+        "lint": "eslint 'src/**/*.{ts,tsx}'",
+        "preview": "vite preview",
+        "test": "echo 'no tests yet' && exit 0"
+    },
+    "dependencies": {
+        "react": "^19.2.5",
+        "react-dom": "^19.2.5",
+        "react-router-dom": "^7.14.2"
+    },
+    "devDependencies": {
+        "@babel/core": "^7.29.0",
+        "@eslint/js": "^10.0.1",
+        "@rolldown/plugin-babel": "^0.2.3",
+        "@types/babel__core": "^7.20.5",
+        "@types/node": "^24.12.2",
+        "@types/react": "^19.2.14",
+        "@types/react-dom": "^19.2.3",
+        "@vitejs/plugin-react": "^6.0.1",
+        "babel-plugin-react-compiler": "^1.0.0",
+        "eslint": "^10.2.1",
+        "eslint-plugin-react-hooks": "^7.1.1",
+        "eslint-plugin-react-refresh": "^0.5.2",
+        "globals": "^17.5.0",
+        "typescript": "~6.0.2",
+        "typescript-eslint": "^8.58.2",
+        "vite": "^8.0.10"
+    }
 }
