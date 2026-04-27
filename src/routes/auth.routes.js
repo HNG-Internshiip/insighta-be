@@ -1,0 +1,13 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const rateLimiter_1 = require("../middleware/rateLimiter");
+const auth_1 = require("../middleware/auth");
+const auth_controller_1 = require("../controllers/auth.controller");
+const router = (0, express_1.Router)();
+router.get("/github", rateLimiter_1.authLimiter, auth_controller_1.githubRedirect);
+router.get("/github/callback", rateLimiter_1.authLimiter, auth_controller_1.githubCallback);
+router.post("/refresh", rateLimiter_1.authLimiter, auth_controller_1.refresh);
+router.post("/logout", auth_1.requireAuth, auth_controller_1.logout);
+router.get("/me", auth_1.requireAuth, auth_controller_1.me);
+exports.default = router;
