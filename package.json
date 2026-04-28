@@ -3,7 +3,7 @@
   "version": "3.0.0",
   "main": "dist/src/app.js",
   "scripts": {
-    "build": "tsc",
+    "build": "npx tsc",
     "start": "node dist/src/app.js",
     "dev": "ts-node-dev --respawn --transpile-only src/app.ts",
     "seed": "node scripts/seed.js",
