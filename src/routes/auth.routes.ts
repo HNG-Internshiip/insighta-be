@@ -1,7 +1,8 @@
 import { Router } from "express";
-import { authLimiter }                                        from "../middleware/rateLimiter";
-import { requireAuth }                                        from "../middleware/auth";
-import { githubRedirect, githubCallback, refresh, logout, me } from "../controllers/auth.controller";
+import { authLimiter }                                           from "../middleware/rateLimiter";
+import { requireAuth }                                           from "../middleware/auth";
+import { githubRedirect, githubCallback,
+         refresh, logout, me }                                   from "../controllers/auth.controller";
 
 const router = Router();
 
