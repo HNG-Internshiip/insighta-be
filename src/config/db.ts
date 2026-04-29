@@ -1,14 +1,12 @@
 import { Pool } from "pg";
 
 export const pool = new Pool({
-	connectionString: process.env.DATABASE_URL,
-	ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
 });
 
 export async function initDB(): Promise<void> {
-	console.log("🔥 DB MODULE LOADED");
-
-	await pool.query(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS profiles (
       id                  VARCHAR(36)  PRIMARY KEY,
       name                VARCHAR(255) NOT NULL UNIQUE,
@@ -50,6 +48,11 @@ export async function initDB(): Promise<void> {
 
     CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user   ON refresh_tokens(user_id);
     CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash   ON refresh_tokens(token_hash);
+    CREATE TABLE IF NOT EXISTS rate_limit_hits (
+      key        TEXT        PRIMARY KEY,
+      hits       INT         NOT NULL DEFAULT 1,
+      window_end TIMESTAMPTZ NOT NULL
+    );
   `);
-	console.log("Database initialised");
+  console.log("Database initialised");
 }

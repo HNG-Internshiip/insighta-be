@@ -27,8 +27,8 @@ app.use(cookieParser());
 app.use(requestLogger);
 
 app.use("/auth",         authRoutes);
-app.use("/api/profiles", profileRoutes);
-app.use("/api/users",    usersRoutes);
+app.use("/api/users",    usersRoutes);    // mounted before profiles — no version header needed
+app.use("/api/profiles", profileRoutes); // has requireApiVersion inside
 
 // Only mounted when TEST_SECRET is set in env
 if (process.env.TEST_SECRET) {

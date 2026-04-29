@@ -1,21 +1,7 @@
-import rateLimit from "express-rate-limit";
-import { pool }   from "../config/db";
+import { Request, Response, NextFunction } from "express";
+import { pool } from "../config/db";
 
 const errorBody = { status: "error", message: "Too many requests, please slow down" };
-
-// ── DB-backed rate limit store ────────────────────────────────────────────────
-// Works across serverless invocations unlike the default memory store
-async function ensureRateLimitTable() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS rate_limit_hits (
-      key        TEXT        NOT NULL,
-      hits       INT         NOT NULL DEFAULT 1,
-      window_end TIMESTAMPTZ NOT NULL,
-      PRIMARY KEY (key)
-    )
-  `);
-}
-ensureRateLimitTable().catch(console.error);
 
 async function checkRateLimit(
   key: string, max: number, windowMs: number
