@@ -182,15 +182,19 @@ export async function githubCallback(req: Request, res: Response): Promise<void>
       return;
     }
 
-    // Web → HTTP-only cookies + redirect
+    // Web → redirect to portal with tokens in URL hash
+    // Cookies can't cross domains (backend vs portal are different Netlify sites)
     const isProd = process.env.NODE_ENV === "production";
     res.cookie("access_token",  access_token, {
-      httpOnly: true, secure: isProd, sameSite: "lax", maxAge: 3 * 60 * 1000,
+      httpOnly: true, secure: isProd, sameSite: "none", maxAge: 3 * 60 * 1000,
     });
     res.cookie("refresh_token", refresh_token, {
-      httpOnly: true, secure: isProd, sameSite: "lax", maxAge: 5 * 60 * 1000,
+      httpOnly: true, secure: isProd, sameSite: "none", maxAge: 5 * 60 * 1000,
     });
-    res.redirect(`${FRONTEND_URL}/dashboard`);
+    // Pass tokens to portal via URL fragment (never hits server, stays in browser)
+    res.redirect(
+      `${FRONTEND_URL}/auth/callback#access_token=${access_token}&refresh_token=${refresh_token}`
+    );
 
   } catch (e) {
     console.error("Callback error:", e);
