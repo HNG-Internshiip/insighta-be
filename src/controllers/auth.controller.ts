@@ -28,6 +28,30 @@ function uuidv7(): string {
   ].join("-");
 }
 
+// ── GET /auth/github/url ──────────────────────────────────────────────────────
+// CLI calls this to get the GitHub OAuth URL without being redirected
+export function githubAuthUrl(req: Request, res: Response): void {
+  const code_challenge = (req.query.code_challenge as string) || "";
+  const state          = (req.query.state          as string) || crypto.randomBytes(16).toString("hex");
+  const redirect_uri   = (req.query.redirect_uri   as string) || `${BACKEND_URL}/auth/github/callback`;
+
+  pkceStore.set(state, { code_challenge, from: "cli" });
+  setTimeout(() => pkceStore.delete(state), 10 * 60 * 1000);
+
+  const params = new URLSearchParams({
+    client_id:    GH_CLIENT_ID,
+    redirect_uri,
+    scope:        "read:user user:email",
+    state,
+  });
+
+  res.json({
+    status:   "success",
+    url:      `https://github.com/login/oauth/authorize?${params}`,
+    state,
+  });
+}
+
 // ── GET /auth/github ──────────────────────────────────────────────────────────
 export function githubRedirect(req: Request, res: Response): void {
   const code_challenge = (req.query.code_challenge as string) || "";
