@@ -29,25 +29,27 @@ function uuidv7(): string {
 }
 
 // ── GET /auth/github/url ──────────────────────────────────────────────────────
-// CLI calls this to get the GitHub OAuth URL without being redirected
 export function githubAuthUrl(req: Request, res: Response): void {
   const code_challenge = (req.query.code_challenge as string) || "";
   const state          = (req.query.state          as string) || crypto.randomBytes(16).toString("hex");
   const redirect_uri   = (req.query.redirect_uri   as string) || `${BACKEND_URL}/auth/github/callback`;
 
+  // Use CLI-specific OAuth app credentials so GitHub accepts 127.0.0.1 callback
+  const clientId = process.env.GITHUB_CLI_CLIENT_ID || GH_CLIENT_ID;
+
   pkceStore.set(state, { code_challenge, from: "cli" });
   setTimeout(() => pkceStore.delete(state), 10 * 60 * 1000);
 
   const params = new URLSearchParams({
-    client_id:    GH_CLIENT_ID,
+    client_id:    clientId,
     redirect_uri,
     scope:        "read:user user:email",
     state,
   });
 
   res.json({
-    status:   "success",
-    url:      `https://github.com/login/oauth/authorize?${params}`,
+    status: "success",
+    url:    `https://github.com/login/oauth/authorize?${params}`,
     state,
   });
 }
@@ -134,13 +136,22 @@ export async function githubCallback(req: Request, res: Response): Promise<void>
     }
 
     // ── Normal GitHub OAuth exchange ──────────────────────────────────────
+    // Use CLI credentials if redirect came from localhost
+    const isCLI      = redirect_uri?.startsWith("http://127.0.0.1") || from === "cli";
+    const clientId   = isCLI && process.env.GITHUB_CLI_CLIENT_ID
+      ? process.env.GITHUB_CLI_CLIENT_ID  : GH_CLIENT_ID;
+    const clientSecret = isCLI && process.env.GITHUB_CLI_CLIENT_SECRET
+      ? process.env.GITHUB_CLI_CLIENT_SECRET : GH_CLIENT_SECRET;
+
     const tokenRes = await axios.post<{ access_token?: string; error?: string }>(
       "https://github.com/login/oauth/access_token",
       {
-        client_id:     GH_CLIENT_ID,
-        client_secret: GH_CLIENT_SECRET,
+        client_id:     clientId,
+        client_secret: clientSecret,
         code,
-        redirect_uri:  `${BACKEND_URL}/auth/github/callback`,
+        redirect_uri:  isCLI
+          ? (req.query.redirect_uri as string || `http://127.0.0.1`)
+          : `${BACKEND_URL}/auth/github/callback`,
       },
       { headers: { Accept: "application/json" } }
     );
