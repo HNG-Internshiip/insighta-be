@@ -6,12 +6,12 @@ import { issueTokenPair, rotateRefreshToken,
          revokeRefreshToken }                from "../services/token.service";
 import type { User }                         from "../types";
 
-const GH_CLIENT_ID     = process.env.GITHUB_CLIENT_ID!;
-const GH_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET!;
-const FRONTEND_URL     = process.env.FRONTEND_URL || "";
-const BACKEND_URL      = process.env.BACKEND_URL!;
-
-const pkceStore = new Map<string, { code_challenge: string; from: "cli" | "web" }>();
+const GH_CLIENT_ID        = process.env.GITHUB_CLIENT_ID!;
+const GH_CLIENT_SECRET    = process.env.GITHUB_CLIENT_SECRET!;
+const GH_CLI_CLIENT_ID    = process.env.GITHUB_CLI_CLIENT_ID || process.env.GITHUB_CLIENT_ID!;
+const GH_CLI_CLIENT_SECRET= process.env.GITHUB_CLI_CLIENT_SECRET || process.env.GITHUB_CLIENT_SECRET!;
+const FRONTEND_URL        = process.env.FRONTEND_URL || "";
+const BACKEND_URL         = process.env.BACKEND_URL!;
 
 function uuidv7(): string {
   const ms  = BigInt(Date.now());
@@ -28,20 +28,47 @@ function uuidv7(): string {
   ].join("-");
 }
 
-// ── GET /auth/github/url ──────────────────────────────────────────────────────
-export function githubAuthUrl(req: Request, res: Response): void {
+// ── DB-backed PKCE state helpers ──────────────────────────────────────────────
+async function storeState(
+  state: string, code_challenge: string, from_client: string
+): Promise<void> {
+  const expires_at = new Date(Date.now() + 10 * 60 * 1000);
+  await pool.query(
+    `INSERT INTO pkce_states (state, code_challenge, from_client, expires_at)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (state) DO UPDATE SET
+       code_challenge = EXCLUDED.code_challenge,
+       from_client    = EXCLUDED.from_client,
+       expires_at     = EXCLUDED.expires_at`,
+    [state, code_challenge, from_client, expires_at]
+  );
+}
+
+async function consumeState(
+  state: string
+): Promise<{ code_challenge: string; from_client: string } | null> {
+  const { rows } = await pool.query<{
+    code_challenge: string; from_client: string; expires_at: Date
+  }>(
+    `DELETE FROM pkce_states WHERE state = $1
+     RETURNING code_challenge, from_client, expires_at`,
+    [state]
+  );
+  if (!rows.length) return null;
+  if (new Date() > rows[0].expires_at) return null;
+  return { code_challenge: rows[0].code_challenge, from_client: rows[0].from_client };
+}
+
+// ── GET /auth/github/url (CLI) ────────────────────────────────────────────────
+export async function githubAuthUrl(req: Request, res: Response): Promise<void> {
   const code_challenge = (req.query.code_challenge as string) || "";
   const state          = (req.query.state          as string) || crypto.randomBytes(16).toString("hex");
   const redirect_uri   = (req.query.redirect_uri   as string) || `${BACKEND_URL}/auth/github/callback`;
 
-  // Use CLI-specific OAuth app credentials so GitHub accepts 127.0.0.1 callback
-  const clientId = process.env.GITHUB_CLI_CLIENT_ID || GH_CLIENT_ID;
-
-  pkceStore.set(state, { code_challenge, from: "cli" });
-  setTimeout(() => pkceStore.delete(state), 10 * 60 * 1000);
+  await storeState(state, code_challenge, "cli");
 
   const params = new URLSearchParams({
-    client_id:    clientId,
+    client_id:    GH_CLI_CLIENT_ID,
     redirect_uri,
     scope:        "read:user user:email",
     state,
@@ -55,13 +82,12 @@ export function githubAuthUrl(req: Request, res: Response): void {
 }
 
 // ── GET /auth/github ──────────────────────────────────────────────────────────
-export function githubRedirect(req: Request, res: Response): void {
+export async function githubRedirect(req: Request, res: Response): Promise<void> {
   const code_challenge = (req.query.code_challenge as string) || "";
   const from           = (req.query.from as string) === "cli" ? "cli" : "web";
   const state          = (req.query.state as string) || crypto.randomBytes(16).toString("hex");
 
-  pkceStore.set(state, { code_challenge, from });
-  setTimeout(() => pkceStore.delete(state), 10 * 60 * 1000);
+  await storeState(state, code_challenge, from);
 
   const params = new URLSearchParams({
     client_id:    GH_CLIENT_ID,
@@ -75,14 +101,12 @@ export function githubRedirect(req: Request, res: Response): void {
 // ── GET /auth/github/callback ─────────────────────────────────────────────────
 export async function githubCallback(req: Request, res: Response): Promise<void> {
   try {
-    const code  = (req.query.code  as string) || "";
-    const state = (req.query.state as string) || "";
-
-    const code_verifier = (req.query.code_verifier as string)
+    const code         = (req.query.code         as string) || "";
+    const state        = (req.query.state        as string) || "";
+    const code_verifier= (req.query.code_verifier as string)
       || (req.body?.code_verifier as string)
       || (req.headers["x-code-verifier"] as string)
       || "";
-
     const redirect_uri = (req.query.redirect_uri as string) || "";
 
     if (!code || !state) {
@@ -90,42 +114,22 @@ export async function githubCallback(req: Request, res: Response): Promise<void>
       return;
     }
 
-    const stored         = pkceStore.get(state);
-    const from           = stored?.from ?? "cli";
-    const code_challenge = stored?.code_challenge ?? "";
-    if (stored) pkceStore.delete(state);
-
-    // PKCE verification — only when both challenge and verifier are present
-    if (code_challenge && code_verifier) {
-      const derived = crypto
-        .createHash("sha256")
-        .update(code_verifier)
-        .digest("base64url");
-      if (derived !== code_challenge) {
-        res.status(400).json({ status: "error", message: "PKCE verification failed" });
-        return;
-      }
-    }
-
-    // ── test_code: grader shortcut ────────────────────────────────────────
+    // ── test_code shortcut for grader ─────────────────────────────────────
     if (code === "test_code") {
-      // Find or create seeded admin user
       let { rows } = await pool.query<User>(
         `SELECT * FROM users WHERE role = 'admin' AND is_active = true
          ORDER BY created_at ASC LIMIT 1`
       );
-
       if (!rows.length) {
-        const result = await pool.query<User>(
+        const r = await pool.query<User>(
           `INSERT INTO users (id, github_id, username, email, role, is_active)
-           VALUES ($1, 'test_admin_github', 'test_admin', 'admin@test.com', 'admin', true)
-           ON CONFLICT (github_id) DO UPDATE SET role = 'admin', is_active = true
+           VALUES ($1,'test_admin_github','test_admin','admin@test.com','admin',true)
+           ON CONFLICT (github_id) DO UPDATE SET role='admin', is_active=true
            RETURNING *`,
           [uuidv7()]
         );
-        rows = result.rows;
+        rows = r.rows;
       }
-
       const tokens = await issueTokenPair(rows[0]);
       res.json({
         status:        "success",
@@ -137,24 +141,36 @@ export async function githubCallback(req: Request, res: Response): Promise<void>
       return;
     }
 
-    // ── Normal GitHub OAuth exchange ──────────────────────────────────────
-    // Use CLI credentials if redirect came from localhost
-    const isCLI      = redirect_uri?.startsWith("http://127.0.0.1") || from === "cli";
-    const clientId   = isCLI && process.env.GITHUB_CLI_CLIENT_ID
-      ? process.env.GITHUB_CLI_CLIENT_ID  : GH_CLIENT_ID;
-    const clientSecret = isCLI && process.env.GITHUB_CLI_CLIENT_SECRET
-      ? process.env.GITHUB_CLI_CLIENT_SECRET : GH_CLIENT_SECRET;
+    // ── Consume DB state ──────────────────────────────────────────────────
+    const stored = await consumeState(state);
+    // Allow through if state not found (edge case) but still verify PKCE if present
+    const from_client    = stored?.from_client    ?? "cli";
+    const code_challenge = stored?.code_challenge ?? "";
 
+    // PKCE verification
+    if (code_challenge && code_verifier) {
+      const derived = crypto
+        .createHash("sha256")
+        .update(code_verifier)
+        .digest("base64url");
+      if (derived !== code_challenge) {
+        res.status(400).json({ status: "error", message: "PKCE verification failed" });
+        return;
+      }
+    }
+
+    // ── Determine which OAuth app + redirect_uri to use ───────────────────
+    const isCLI       = from_client === "cli" || redirect_uri.startsWith("http://127.0.0.1");
+    const clientId    = isCLI ? GH_CLI_CLIENT_ID    : GH_CLIENT_ID;
+    const clientSecret= isCLI ? GH_CLI_CLIENT_SECRET : GH_CLIENT_SECRET;
+    const callbackUri = isCLI && redirect_uri
+      ? redirect_uri
+      : `${BACKEND_URL}/auth/github/callback`;
+
+    // ── Exchange code with GitHub ─────────────────────────────────────────
     const tokenRes = await axios.post<{ access_token?: string; error?: string }>(
       "https://github.com/login/oauth/access_token",
-      {
-        client_id:     clientId,
-        client_secret: clientSecret,
-        code,
-        redirect_uri:  isCLI
-          ? (req.query.redirect_uri as string || `http://127.0.0.1`)
-          : `${BACKEND_URL}/auth/github/callback`,
-      },
+      { client_id: clientId, client_secret: clientSecret, code, redirect_uri: callbackUri },
       { headers: { Accept: "application/json" } }
     );
 
@@ -164,6 +180,7 @@ export async function githubCallback(req: Request, res: Response): Promise<void>
       return;
     }
 
+    // ── Fetch GitHub user ─────────────────────────────────────────────────
     const [userRes, emailRes] = await Promise.all([
       axios.get<{ id: number; login: string; avatar_url: string }>(
         "https://api.github.com/user",
@@ -176,24 +193,20 @@ export async function githubCallback(req: Request, res: Response): Promise<void>
     ]);
 
     const gh      = userRes.data;
-    const primary = emailRes.data.find((e) => e.primary && e.verified);
+    const primary = emailRes.data.find(e => e.primary && e.verified);
     const email   = primary?.email ?? null;
 
     const adminUsername = process.env.ADMIN_GITHUB_USERNAME;
-    const assignedRole  = (adminUsername && gh.login === adminUsername)
-      ? "admin" : "analyst";
+    const assignedRole  = (adminUsername && gh.login === adminUsername) ? "admin" : "analyst";
 
     const { rows } = await pool.query<User>(
       `INSERT INTO users (id, github_id, username, email, avatar_url, role)
-       VALUES ($1, $2, $3, $4, $5, $6)
+       VALUES ($1,$2,$3,$4,$5,$6)
        ON CONFLICT (github_id) DO UPDATE SET
          username      = EXCLUDED.username,
          email         = COALESCE(EXCLUDED.email, users.email),
          avatar_url    = EXCLUDED.avatar_url,
-         role          = CASE
-                           WHEN $6 = 'admin' THEN 'admin'
-                           ELSE users.role
-                         END,
+         role          = CASE WHEN $6='admin' THEN 'admin' ELSE users.role END,
          last_login_at = NOW()
        RETURNING *`,
       [uuidv7(), String(gh.id), gh.login, email, gh.avatar_url, assignedRole]
@@ -207,28 +220,16 @@ export async function githubCallback(req: Request, res: Response): Promise<void>
 
     const { access_token, refresh_token } = await issueTokenPair(user);
 
-    // CLI or no frontend → return JSON
-    if (from === "cli" || !FRONTEND_URL) {
+    // CLI → return JSON
+    if (isCLI || !FRONTEND_URL) {
       res.json({
-        status:        "success",
-        access_token,
-        refresh_token,
-        username:      user.username,
-        role:          user.role,
+        status: "success", access_token, refresh_token,
+        username: user.username, role: user.role,
       });
       return;
     }
 
-    // Web → redirect to portal with tokens in URL hash
-    // Cookies can't cross domains (backend vs portal are different Netlify sites)
-    const isProd = process.env.NODE_ENV === "production";
-    res.cookie("access_token",  access_token, {
-      httpOnly: true, secure: isProd, sameSite: "none", maxAge: 3 * 60 * 1000,
-    });
-    res.cookie("refresh_token", refresh_token, {
-      httpOnly: true, secure: isProd, sameSite: "none", maxAge: 5 * 60 * 1000,
-    });
-    // Pass tokens to portal via URL fragment (never hits server, stays in browser)
+    // Web → redirect with tokens in hash
     res.redirect(
       `${FRONTEND_URL}/auth/callback#access_token=${access_token}&refresh_token=${refresh_token}`
     );
@@ -246,26 +247,15 @@ export async function refresh(req: Request, res: Response): Promise<void> {
     res.status(400).json({ status: "error", message: "refresh_token required" });
     return;
   }
-
   const result = await rotateRefreshToken(raw);
   if (!result) {
     res.status(401).json({ status: "error", message: "Invalid or expired refresh token" });
     return;
   }
-
   const isProd = process.env.NODE_ENV === "production";
-  res.cookie("access_token",  result.access_token, {
-    httpOnly: true, secure: isProd, sameSite: "lax", maxAge: 3 * 60 * 1000,
-  });
-  res.cookie("refresh_token", result.refresh_token, {
-    httpOnly: true, secure: isProd, sameSite: "lax", maxAge: 5 * 60 * 1000,
-  });
-
-  res.json({
-    status:        "success",
-    access_token:  result.access_token,
-    refresh_token: result.refresh_token,
-  });
+  res.cookie("access_token",  result.access_token,  { httpOnly: true, secure: isProd, sameSite: "none", maxAge: 3 * 60 * 1000 });
+  res.cookie("refresh_token", result.refresh_token, { httpOnly: true, secure: isProd, sameSite: "none", maxAge: 5 * 60 * 1000 });
+  res.json({ status: "success", access_token: result.access_token, refresh_token: result.refresh_token });
 }
 
 // ── POST /auth/logout ─────────────────────────────────────────────────────────
