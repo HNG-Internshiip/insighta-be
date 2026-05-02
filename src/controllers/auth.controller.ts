@@ -83,6 +83,8 @@ export async function githubCallback(req: Request, res: Response): Promise<void>
       || (req.headers["x-code-verifier"] as string)
       || "";
 
+    const redirect_uri = (req.query.redirect_uri as string) || "";
+
     if (!code || !state) {
       res.status(400).json({ status: "error", message: "Missing code or state" });
       return;
