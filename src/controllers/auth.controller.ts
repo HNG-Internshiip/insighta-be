@@ -30,33 +30,39 @@ function uuidv7(): string {
 
 // ── DB-backed PKCE state helpers ──────────────────────────────────────────────
 async function storeState(
-  state: string, code_challenge: string, from_client: string
+  state: string, code_challenge: string, from_client: string, redirect_uri = ""
 ): Promise<void> {
   const expires_at = new Date(Date.now() + 10 * 60 * 1000);
   await pool.query(
-    `INSERT INTO pkce_states (state, code_challenge, from_client, expires_at)
-     VALUES ($1, $2, $3, $4)
+    `INSERT INTO pkce_states (state, code_challenge, from_client, redirect_uri, expires_at)
+     VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (state) DO UPDATE SET
        code_challenge = EXCLUDED.code_challenge,
        from_client    = EXCLUDED.from_client,
+       redirect_uri   = EXCLUDED.redirect_uri,
        expires_at     = EXCLUDED.expires_at`,
-    [state, code_challenge, from_client, expires_at]
+    [state, code_challenge, from_client, redirect_uri, expires_at]
   );
 }
 
 async function consumeState(
   state: string
-): Promise<{ code_challenge: string; from_client: string } | null> {
+): Promise<{ code_challenge: string; from_client: string; redirect_uri: string } | null> {
   const { rows } = await pool.query<{
-    code_challenge: string; from_client: string; expires_at: Date
+    code_challenge: string; from_client: string;
+    redirect_uri: string; expires_at: Date;
   }>(
     `DELETE FROM pkce_states WHERE state = $1
-     RETURNING code_challenge, from_client, expires_at`,
+     RETURNING code_challenge, from_client, redirect_uri, expires_at`,
     [state]
   );
   if (!rows.length) return null;
   if (new Date() > rows[0].expires_at) return null;
-  return { code_challenge: rows[0].code_challenge, from_client: rows[0].from_client };
+  return {
+    code_challenge: rows[0].code_challenge,
+    from_client:    rows[0].from_client,
+    redirect_uri:   rows[0].redirect_uri,
+  };
 }
 
 // ── GET /auth/github/url (CLI) ────────────────────────────────────────────────
@@ -65,7 +71,7 @@ export async function githubAuthUrl(req: Request, res: Response): Promise<void> 
   const state          = (req.query.state          as string) || crypto.randomBytes(16).toString("hex");
   const redirect_uri   = (req.query.redirect_uri   as string) || `${BACKEND_URL}/auth/github/callback`;
 
-  await storeState(state, code_challenge, "cli");
+  await storeState(state, code_challenge, "cli", redirect_uri);
 
   const params = new URLSearchParams({
     client_id:    GH_CLI_CLIENT_ID,
@@ -167,7 +173,6 @@ export async function githubCallback(req: Request, res: Response): Promise<void>
       ? redirect_uri
       : `${BACKEND_URL}/auth/github/callback`;
 
-    // ── Exchange code with GitHub ─────────────────────────────────────────
     const tokenRes = await axios.post<{ access_token?: string; error?: string }>(
       "https://github.com/login/oauth/access_token",
       { client_id: clientId, client_secret: clientSecret, code, redirect_uri: callbackUri },
@@ -176,7 +181,9 @@ export async function githubCallback(req: Request, res: Response): Promise<void>
 
     const ghToken = tokenRes.data.access_token;
     if (!ghToken) {
-      res.status(400).json({ status: "error", message: "GitHub token exchange failed" });
+      console.error("GitHub exchange failed:", JSON.stringify(tokenRes.data));
+      console.error("Exchange params — client_id:", clientId, "redirect_uri:", callbackUri);
+      res.status(400).json({ status: "error", message: "GitHub token exchange failed", detail: tokenRes.data });
       return;
     }
 

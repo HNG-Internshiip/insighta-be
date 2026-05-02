@@ -49,10 +49,11 @@ export async function initDB(): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user   ON refresh_tokens(user_id);
     CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash   ON refresh_tokens(token_hash);
     CREATE TABLE IF NOT EXISTS pkce_states (
-      state         TEXT        PRIMARY KEY,
-      code_challenge TEXT       NOT NULL,
-      from_client   TEXT        NOT NULL DEFAULT 'web',
-      expires_at    TIMESTAMPTZ NOT NULL
+      state          TEXT        PRIMARY KEY,
+      code_challenge TEXT        NOT NULL,
+      from_client    TEXT        NOT NULL DEFAULT 'web',
+      redirect_uri   TEXT        NOT NULL DEFAULT '',
+      expires_at     TIMESTAMPTZ NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS rate_limit_hits (
