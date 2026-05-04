@@ -1,25 +1,35 @@
-import { Request, Response } from "express";
-import { pool }                    from "../config/db";
-import { parseQuery }              from "../services/nlp.service";
-import { createProfileFromName }   from "../services/profile.service";
-import type { ProfileFilters, SortField, SortOrder, Pagination, Profile } from "../types";
+import { Request, Response }           from "express";
+import { pool }                         from "../config/db";
+import { parseQuery }                   from "../services/nlp.service";
+import { createProfileFromName }        from "../services/profile.service";
+import { normalizeFilters, buildCacheKey } from "../services/queryNormalizer";
+import { getCache, setCache }           from "../services/cache.service";
+import type {
+  ProfileFilters, SortField, SortOrder, Pagination, Profile
+} from "../types";
 
-// ── Query builder (shared) ────────────────────────────────────────────────────
+// ── Query builder ─────────────────────────────────────────────────────────────
+
 interface QueryBundle {
-  countSQL: string; countParams: unknown[];
-  dataSQL:  string; dataParams:  unknown[];
+  countSQL:    string;
+  countParams: unknown[];
+  dataSQL:     string;
+  dataParams:  unknown[];
 }
 
 function buildQuery(
-  filters: ProfileFilters, sortBy: SortField,
-  sortOrder: SortOrder, pagination: Pagination
+  filters:    ProfileFilters,
+  sortBy:     SortField,
+  sortOrder:  SortOrder,
+  pagination: Pagination,
 ): QueryBundle {
-  const conds: string[] = [];
+  const conds:  string[]  = [];
   const params: unknown[] = [];
-  let idx = 1;
+  let   idx = 1;
 
   const add = (col: string, op: string, val: unknown) => {
-    conds.push(`${col} ${op} $${idx++}`); params.push(val);
+    conds.push(`${col} ${op} $${idx++}`);
+    params.push(val);
   };
 
   if (filters.gender                  != null) add("gender",              "=",  filters.gender);
@@ -30,29 +40,40 @@ function buildQuery(
   if (filters.min_gender_probability  != null) add("gender_probability",  ">=", filters.min_gender_probability);
   if (filters.min_country_probability != null) add("country_probability", ">=", filters.min_country_probability);
 
-  const where      = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
-  const col        = sortBy === "age" ? "age" : sortBy === "gender_probability" ? "gender_probability" : "created_at";
-  const countSQL   = `SELECT COUNT(*)::INT AS total FROM profiles ${where}`;
-  const dataSQL    = `
-    SELECT id, name, gender, gender_probability, age, age_group,
-           country_id, country_name, country_probability,
-           to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
-    FROM profiles ${where}
+  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  const col   = sortBy === "age" ? "age"
+              : sortBy === "gender_probability" ? "gender_probability"
+              : "created_at";
+
+  const countSQL  = `SELECT COUNT(*)::INT AS total FROM profiles ${where}`;
+  const dataSQL   = `
+    SELECT
+      id, name, gender, gender_probability,
+      age, age_group, country_id, country_name, country_probability,
+      to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+    FROM profiles
+    ${where}
     ORDER BY ${col} ${sortOrder}
     LIMIT $${idx++} OFFSET $${idx}
   `;
-  return { countSQL, countParams: [...params],
-           dataSQL,  dataParams:  [...params, pagination.limit, pagination.offset] };
+
+  return {
+    countSQL,
+    countParams: [...params],
+    dataSQL,
+    dataParams:  [...params, pagination.limit, pagination.offset],
+  };
 }
 
-// ── Pagination links helper ───────────────────────────────────────────────────
-function buildLinks(baseUrl: string, page: number, limit: number, total: number) {
+// ── Pagination links ──────────────────────────────────────────────────────────
+
+function buildLinks(url: string, page: number, limit: number, total: number) {
   const totalPages = Math.ceil(total / limit);
   const qs = (p: number) => {
-    const url = new URL(baseUrl, "http://x");
-    url.searchParams.set("page",  String(p));
-    url.searchParams.set("limit", String(limit));
-    return url.pathname + "?" + url.searchParams.toString();
+    const u = new URL(url, "http://x");
+    u.searchParams.set("page",  String(p));
+    u.searchParams.set("limit", String(limit));
+    return u.pathname + "?" + u.searchParams.toString();
   };
   return {
     self: qs(page),
@@ -61,33 +82,70 @@ function buildLinks(baseUrl: string, page: number, limit: number, total: number)
   };
 }
 
-function paginatedResponse(
-  res: Response, data: Profile[], total: number,
-  pagination: Pagination, req: Request
-) {
+// ── Shared execute + cache handler ────────────────────────────────────────────
+
+async function executeQuery(
+  filters:    ProfileFilters,
+  sortBy:     SortField,
+  sortOrder:  SortOrder,
+  pagination: Pagination,
+  req:        Request,
+  res:        Response,
+): Promise<void> {
+  // 1. Normalize filters for consistent cache keys
+  const normalized = normalizeFilters(filters);
+
+  // 2. Build cache key
+  const cacheKey = buildCacheKey({ filters: normalized, sortBy, sortOrder, ...pagination });
+
+  // 3. Check cache
+  const cached = await getCache(cacheKey);
+  if (cached) {
+    res.setHeader("X-Cache", "HIT");
+    res.json(JSON.parse(cached));
+    return;
+  }
+
+  // 4. Execute SQL
+  const { countSQL, countParams, dataSQL, dataParams } =
+    buildQuery(normalized, sortBy, sortOrder, pagination);
+
+  const [cr, dr] = await Promise.all([
+    pool.query<{ total: number }>(countSQL, countParams),
+    pool.query<Profile>(dataSQL, dataParams),
+  ]);
+
+  const total      = cr.rows[0].total;
   const totalPages = Math.ceil(total / pagination.limit);
-  res.json({
+
+  const body = {
     status:      "success",
     page:        pagination.page,
     limit:       pagination.limit,
     total,
     total_pages: totalPages,
     links:       buildLinks(req.originalUrl, pagination.page, pagination.limit, total),
-    data,
-  });
+    data:        dr.rows,
+  };
+
+  // 5. Store in cache
+  await setCache(cacheKey, JSON.stringify(body));
+
+  res.setHeader("X-Cache", "MISS");
+  res.json(body);
 }
 
 // ── GET /api/profiles ─────────────────────────────────────────────────────────
+
 export async function getProfiles(req: Request, res: Response): Promise<void> {
   try {
-    const { countSQL, countParams, dataSQL, dataParams } =
-      buildQuery(req.filters!, req.sortBy!, req.sortOrder!, req.pagination!);
-
-    const [cr, dr] = await Promise.all([
-      pool.query<{ total: number }>(countSQL, countParams),
-      pool.query<Profile>(dataSQL, dataParams),
-    ]);
-    paginatedResponse(res, dr.rows, cr.rows[0].total, req.pagination!, req);
+    await executeQuery(
+      req.filters!,
+      req.sortBy!,
+      req.sortOrder!,
+      req.pagination!,
+      req, res,
+    );
   } catch (e) {
     console.error(e);
     res.status(500).json({ status: "error", message: "Internal server error" });
@@ -95,6 +153,7 @@ export async function getProfiles(req: Request, res: Response): Promise<void> {
 }
 
 // ── GET /api/profiles/search ──────────────────────────────────────────────────
+
 export async function searchProfiles(req: Request, res: Response): Promise<void> {
   try {
     const filters = parseQuery(req.rawQuery!);
@@ -102,14 +161,7 @@ export async function searchProfiles(req: Request, res: Response): Promise<void>
       res.status(400).json({ status: "error", message: "Unable to interpret query" });
       return;
     }
-    const { countSQL, countParams, dataSQL, dataParams } =
-      buildQuery(filters, "created_at", "ASC", req.pagination!);
-
-    const [cr, dr] = await Promise.all([
-      pool.query<{ total: number }>(countSQL, countParams),
-      pool.query<Profile>(dataSQL, dataParams),
-    ]);
-    paginatedResponse(res, dr.rows, cr.rows[0].total, req.pagination!, req);
+    await executeQuery(filters, "created_at", "ASC", req.pagination!, req, res);
   } catch (e) {
     console.error(e);
     res.status(500).json({ status: "error", message: "Internal server error" });
@@ -117,10 +169,15 @@ export async function searchProfiles(req: Request, res: Response): Promise<void>
 }
 
 // ── GET /api/profiles/export ──────────────────────────────────────────────────
+
 export async function exportProfiles(req: Request, res: Response): Promise<void> {
   try {
-    const { dataSQL, dataParams } =
-      buildQuery(req.filters!, req.sortBy!, req.sortOrder!, { page: 1, limit: 100_000, offset: 0 });
+    // Exports always bypass cache — analysts expect fresh data
+    const normalized = normalizeFilters(req.filters!);
+    const { dataSQL, dataParams } = buildQuery(
+      normalized, req.sortBy!, req.sortOrder!,
+      { page: 1, limit: 100_000, offset: 0 }
+    );
 
     const { rows } = await pool.query<Profile>(dataSQL, dataParams);
 
@@ -142,6 +199,7 @@ export async function exportProfiles(req: Request, res: Response): Promise<void>
 }
 
 // ── GET /api/profiles/:id ─────────────────────────────────────────────────────
+
 export async function getProfileById(req: Request, res: Response): Promise<void> {
   try {
     const { rows } = await pool.query<Profile>(
@@ -162,10 +220,11 @@ export async function getProfileById(req: Request, res: Response): Promise<void>
   }
 }
 
-// ── POST /api/profiles (admin only) ──────────────────────────────────────────
+// ── POST /api/profiles ────────────────────────────────────────────────────────
+
 export async function createProfile(req: Request, res: Response): Promise<void> {
   try {
-    const { name } = req.body;
+    const { name } = req.body as { name?: string };
     if (!name?.trim()) {
       res.status(400).json({ status: "error", message: "name is required" });
       return;
@@ -178,7 +237,8 @@ export async function createProfile(req: Request, res: Response): Promise<void> 
   }
 }
 
-// ── DELETE /api/profiles/:id (admin only) ─────────────────────────────────────
+// ── DELETE /api/profiles/:id ──────────────────────────────────────────────────
+
 export async function deleteProfile(req: Request, res: Response): Promise<void> {
   try {
     const { rowCount } = await pool.query(
