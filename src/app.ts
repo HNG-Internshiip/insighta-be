@@ -1,8 +1,9 @@
 import "dotenv/config";
 import express, { Request, Response } from "express";
-import cors         from "cors";
-import cookieParser from "cookie-parser";
+import cors          from "cors";
+import cookieParser  from "cookie-parser";
 import { initDB }        from "./config/db";
+import { connectCache }  from "./services/cache.service";
 import { requestLogger } from "./middleware/logger";
 import authRoutes        from "./routes/auth.routes";
 import profileRoutes     from "./routes/profiles.routes";
@@ -27,17 +28,19 @@ app.use(cookieParser());
 app.use(requestLogger);
 
 app.use("/auth",         authRoutes);
-app.use("/api/users",    usersRoutes);    // mounted before profiles — no version header needed
-app.use("/api/profiles", profileRoutes); // has requireApiVersion inside
+app.use("/api/users",    usersRoutes);
+app.use("/api/profiles", profileRoutes);
 
-// Only mounted when TEST_SECRET is set in env
 if (process.env.TEST_SECRET) {
   app.use("/auth", testAuthRoutes);
   console.log("Test auth route enabled");
 }
 
 app.get("/health", (_req: Request, res: Response) =>
-  res.json({ status: "ok", timestamp: new Date().toISOString() })
+  res.json({
+    status:    "ok",
+    timestamp: new Date().toISOString(),
+  })
 );
 
 app.use((_req: Request, res: Response) =>
@@ -46,7 +49,7 @@ app.use((_req: Request, res: Response) =>
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 
-initDB()
+Promise.all([initDB(), connectCache()])
   .then(() => app.listen(PORT, () => console.log(`Insighta API on port ${PORT}`)))
   .catch((e) => { console.error(e); process.exit(1); });
 
