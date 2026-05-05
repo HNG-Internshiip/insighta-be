@@ -1,17 +1,27 @@
 /**
- * CSV Ingestion Service
+ * CSV Ingestion Service — Optimized for large files (up to 500k rows)
  *
- * Streams a CSV upload, validates each row, and batch-inserts
- * valid rows in chunks of 500. Never loads the entire file into memory.
- * A single bad row never fails the entire upload.
- * Rows already inserted on a partial failure are kept — no rollback.
+ * Architecture:
+ * - Line-by-line streaming via async generator (no memory spike)
+ * - Rows validated as they arrive
+ * - Valid rows accumulated into batches of 2,000
+ * - Up to 5 batches inserted concurrently (parallel DB round-trips)
+ * - Bad rows never abort the upload
+ * - No rollback — already-inserted rows are kept on failure
+ *
+ * Why concurrent inserts:
+ * Sequential inserts at 20ms/batch × 250 batches (500k/2000) = 5 seconds minimum.
+ * 5 concurrent inserts reduce wall-clock time to ~1 second for the DB portion.
  */
 
-import { Readable }   from "stream";
-import { pipeline }   from "stream/promises";
-import { Transform }  from "stream";
-import { pool }       from "../config/db";
+import { Readable }            from "stream";
+import { pool }                from "../config/db";
 import { invalidateNamespace } from "./cache.service";
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const BATCH_SIZE    = 2000;  // rows per INSERT statement
+const CONCURRENCY   = 5;     // parallel INSERT statements in flight
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -29,17 +39,6 @@ export interface IngestionResult {
   };
 }
 
-interface RawRow {
-  name?:                string;
-  gender?:              string;
-  gender_probability?:  string;
-  age?:                 string;
-  age_group?:           string;
-  country_id?:          string;
-  country_name?:        string;
-  country_probability?: string;
-}
-
 interface ValidRow {
   id:                  string;
   name:                string;
@@ -52,14 +51,11 @@ interface ValidRow {
   country_probability: number;
 }
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-const CHUNK_SIZE    = 500;
 const VALID_GENDERS = new Set(["male", "female"]);
 const VALID_GROUPS  = new Set(["child", "teenager", "adult", "senior"]);
 const REQUIRED      = ["name", "gender", "age", "country_id", "country_name"] as const;
-
-// ── UUID v7 ───────────────────────────────────────────────────────────────────
 
 function uuidv7(): string {
   const ms  = BigInt(Date.now());
@@ -83,71 +79,84 @@ function getAgeGroup(age: number): string {
   return "senior";
 }
 
-// ── Row Validation ────────────────────────────────────────────────────────────
+function parseCSVLine(line: string): string[] {
+  const fields: string[] = [];
+  let   current = "";
+  let   inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
+      else inQuotes = !inQuotes;
+    } else if (ch === "," && !inQuotes) {
+      fields.push(current.trim());
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  fields.push(current.trim());
+  return fields;
+}
 
 type ValidationResult =
   | { ok: true;  row: ValidRow }
   | { ok: false; reason: string };
 
-function validateRow(raw: RawRow): ValidationResult {
-  // Check required fields
-  for (const field of REQUIRED) {
-    if (!raw[field]?.trim()) {
-      return { ok: false, reason: "missing_fields" };
-    }
+function validateRow(
+  headers: string[],
+  fields:  string[],
+): ValidationResult {
+  if (fields.length !== headers.length) {
+    return { ok: false, reason: "malformed_row" };
   }
 
-  const name       = raw.name!.trim();
-  const gender     = raw.gender!.trim().toLowerCase();
-  const country_id = raw.country_id!.trim().toUpperCase();
-  const country_name = raw.country_name!.trim();
+  const cell: Record<string, string> = {};
+  headers.forEach((h, i) => { cell[h] = fields[i] ?? ""; });
 
-  if (!VALID_GENDERS.has(gender)) {
-    return { ok: false, reason: "invalid_gender" };
+  for (const f of REQUIRED) {
+    if (!cell[f]?.trim()) return { ok: false, reason: "missing_fields" };
   }
 
-  const age = parseInt(raw.age ?? "", 10);
-  if (isNaN(age) || age < 0 || age > 150) {
-    return { ok: false, reason: "invalid_age" };
-  }
+  const name        = cell.name.trim();
+  const gender      = cell.gender.trim().toLowerCase();
+  const country_id  = cell.country_id.trim().toUpperCase();
+  const country_name= cell.country_name.trim();
 
-  const gender_probability  = parseFloat(raw.gender_probability  ?? "0.5");
-  const country_probability = parseFloat(raw.country_probability ?? "0.5");
+  if (!VALID_GENDERS.has(gender))     return { ok: false, reason: "invalid_gender" };
 
-  if (isNaN(gender_probability)  || gender_probability  < 0 || gender_probability  > 1) {
-    return { ok: false, reason: "invalid_gender_probability" };
-  }
-  if (isNaN(country_probability) || country_probability < 0 || country_probability > 1) {
-    return { ok: false, reason: "invalid_country_probability" };
-  }
+  const age = parseInt(cell.age ?? "", 10);
+  if (isNaN(age) || age < 0 || age > 150) return { ok: false, reason: "invalid_age" };
 
-  // Derive age_group — use provided value if valid, otherwise compute
-  const rawGroup    = raw.age_group?.trim().toLowerCase() ?? "";
-  const age_group   = VALID_GROUPS.has(rawGroup) ? rawGroup : getAgeGroup(age);
+  const gp = parseFloat(cell.gender_probability  ?? "0.5");
+  const cp = parseFloat(cell.country_probability ?? "0.5");
+  if (isNaN(gp) || gp < 0 || gp > 1) return { ok: false, reason: "invalid_gender_probability" };
+  if (isNaN(cp) || cp < 0 || cp > 1) return { ok: false, reason: "invalid_country_probability" };
+
+  const rawGroup = cell.age_group?.trim().toLowerCase() ?? "";
+  const age_group = VALID_GROUPS.has(rawGroup) ? rawGroup : getAgeGroup(age);
 
   return {
     ok: true,
     row: {
-      id: uuidv7(),
+      id:                  uuidv7(),
       name,
       gender,
-      gender_probability:  Math.round(gender_probability  * 1000) / 1000,
+      gender_probability:  Math.round(gp * 1000) / 1000,
       age,
       age_group,
       country_id,
       country_name,
-      country_probability: Math.round(country_probability * 1000) / 1000,
+      country_probability: Math.round(cp * 1000) / 1000,
     },
   };
 }
 
 // ── Batch Insert ──────────────────────────────────────────────────────────────
 
-async function insertBatch(
-  rows: ValidRow[],
-  result: IngestionResult
-): Promise<void> {
-  if (rows.length === 0) return;
+async function insertBatch(rows: ValidRow[]): Promise<{ inserted: number; duplicates: number }> {
+  if (rows.length === 0) return { inserted: 0, duplicates: 0 };
 
   const cols = [
     "id","name","gender","gender_probability",
@@ -159,7 +168,9 @@ async function insertBatch(
   let   p = 1;
 
   for (const row of rows) {
-    placeholders.push(`($${p},$${p+1},$${p+2},$${p+3},$${p+4},$${p+5},$${p+6},$${p+7},$${p+8})`);
+    placeholders.push(
+      `($${p},$${p+1},$${p+2},$${p+3},$${p+4},$${p+5},$${p+6},$${p+7},$${p+8})`
+    );
     values.push(
       row.id, row.name, row.gender, row.gender_probability,
       row.age, row.age_group, row.country_id, row.country_name, row.country_probability
@@ -173,49 +184,63 @@ async function insertBatch(
     ON CONFLICT (name) DO NOTHING
   `;
 
-  try {
-    const res = await pool.query(sql, values);
-    const inserted  = res.rowCount ?? 0;
-    const duplicate = rows.length - inserted;
-
-    result.inserted                += inserted;
-    result.skipped                 += duplicate;
-    result.reasons.duplicate_name  += duplicate;
-  } catch (e) {
-    // Batch insert failed — count all rows as skipped rather than crashing
-    console.error("Batch insert error:", e);
-    result.skipped += rows.length;
-  }
+  const res        = await pool.query(sql, values);
+  const inserted   = res.rowCount ?? 0;
+  const duplicates = rows.length - inserted;
+  return { inserted, duplicates };
 }
 
-// ── CSV Line Parser ───────────────────────────────────────────────────────────
+// ── Async line generator — true streaming, no memory spike ───────────────────
 
-function parseCSVLine(line: string): string[] {
-  const fields: string[] = [];
-  let   current          = "";
-  let   inQuotes         = false;
+async function* readLines(stream: Readable): AsyncGenerator<string> {
+  let leftover = "";
 
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === '"') {
-      if (inQuotes && line[i + 1] === '"') {
-        current += '"';
-        i++;
-      } else {
-        inQuotes = !inQuotes;
-      }
-    } else if (ch === "," && !inQuotes) {
-      fields.push(current.trim());
-      current = "";
-    } else {
-      current += ch;
+  for await (const chunk of stream) {
+    const text  = leftover + (chunk as Buffer).toString("utf8");
+    const lines = text.split("\n");
+    leftover    = lines.pop() ?? "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed) yield trimmed;
     }
   }
-  fields.push(current.trim());
-  return fields;
+
+  if (leftover.trim()) yield leftover.trim();
 }
 
-// ── Main Ingestion Function ───────────────────────────────────────────────────
+// ── Concurrent batch processor ────────────────────────────────────────────────
+// Maintains up to CONCURRENCY insert promises in flight simultaneously.
+// When the pool is full, waits for the oldest one to finish before adding more.
+
+async function flushWithConcurrency(
+  batches:    ValidRow[][],
+  result:     IngestionResult,
+): Promise<void> {
+  const inFlight: Promise<void>[] = [];
+
+  for (const batch of batches) {
+    const p = insertBatch(batch).then(({ inserted, duplicates }) => {
+      result.inserted               += inserted;
+      result.skipped                += duplicates;
+      result.reasons.duplicate_name += duplicates;
+    }).catch((e) => {
+      console.error("Batch insert error:", e);
+      result.skipped += batch.length;
+    });
+
+    inFlight.push(p);
+
+    if (inFlight.length >= CONCURRENCY) {
+      // Wait for the oldest batch before queuing more
+      await inFlight.shift();
+    }
+  }
+
+  // Drain remaining in-flight batches
+  await Promise.all(inFlight);
+}
+
+// ── Main ingestion function ───────────────────────────────────────────────────
 
 export async function ingestCSV(stream: Readable): Promise<IngestionResult> {
   const result: IngestionResult = {
@@ -231,99 +256,53 @@ export async function ingestCSV(stream: Readable): Promise<IngestionResult> {
     },
   };
 
-  let headers:    string[]   = [];
-  let buffer:     ValidRow[] = [];
-  let leftover    = "";
-  let headerParsed = false;
+  let headers:      string[]    = [];
+  let headerParsed              = false;
+  let validBuffer:  ValidRow[]  = [];
+  const pendingBatches: ValidRow[][] = [];
 
-  // Process stream line by line without loading entire file into memory
-  await new Promise<void>((resolve, reject) => {
-    stream.on("data", async (chunk: Buffer | string) => {
-      const text  = leftover + chunk.toString("utf8");
-      const lines = text.split("\n");
-      leftover    = lines.pop() ?? ""; // keep incomplete last line
+  for await (const line of readLines(stream)) {
+    if (!headerParsed) {
+      headers      = parseCSVLine(line).map(h => h.toLowerCase().trim());
+      headerParsed = true;
+      continue;
+    }
 
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (!line) continue;
+    result.total_rows++;
 
-        // First non-empty line is the header
-        if (!headerParsed) {
-          headers      = parseCSVLine(line).map(h => h.toLowerCase().trim());
-          headerParsed = true;
-          continue;
-        }
+    const fields     = parseCSVLine(line);
+    const validation = validateRow(headers, fields);
 
-        result.total_rows++;
+    if (!validation.ok) {
+      result.skipped++;
+      result.reasons[validation.reason] = (result.reasons[validation.reason] ?? 0) + 1;
+      continue;
+    }
 
-        const fields = parseCSVLine(line);
+    validBuffer.push(validation.row);
 
-        // Malformed row — wrong column count
-        if (fields.length !== headers.length) {
-          result.skipped++;
-          result.reasons.malformed_row++;
-          continue;
-        }
+    if (validBuffer.length >= BATCH_SIZE) {
+      pendingBatches.push(validBuffer.splice(0, BATCH_SIZE));
 
-        const raw: RawRow = {};
-        headers.forEach((h, i) => { (raw as Record<string, string>)[h] = fields[i]; });
-
-        const validation = validateRow(raw);
-        if (!validation.ok) {
-          result.skipped++;
-          result.reasons[validation.reason] = (result.reasons[validation.reason] ?? 0) + 1;
-          continue;
-        }
-
-        buffer.push(validation.row);
-
-        // Flush chunk when buffer is full
-        if (buffer.length >= CHUNK_SIZE) {
-          stream.pause();
-          const chunk = buffer.splice(0, CHUNK_SIZE);
-          try {
-            await insertBatch(chunk, result);
-          } finally {
-            stream.resume();
-          }
-        }
+      // Flush when we have accumulated enough batches to fill the concurrency pool
+      if (pendingBatches.length >= CONCURRENCY) {
+        await flushWithConcurrency(pendingBatches.splice(0, CONCURRENCY), result);
       }
-    });
+    }
+  }
 
-    stream.on("end", async () => {
-      // Handle final leftover line
-      if (leftover.trim() && headerParsed) {
-        const line   = leftover.trim();
-        const fields = parseCSVLine(line);
-        if (fields.length === headers.length) {
-          result.total_rows++;
-          const raw: RawRow = {};
-          headers.forEach((h, i) => { (raw as Record<string,string>)[h] = fields[i]; });
-          const validation = validateRow(raw);
-          if (validation.ok) {
-            buffer.push(validation.row);
-          } else {
-            result.skipped++;
-            result.reasons[validation.reason] = (result.reasons[validation.reason] ?? 0) + 1;
-          }
-        }
-      }
+  // Push any remaining rows as a final batch
+  if (validBuffer.length > 0) {
+    pendingBatches.push(validBuffer);
+  }
 
-      // Flush remaining buffer
-      try {
-        await insertBatch(buffer, result);
-      } catch (e) {
-        console.error("Final batch insert error:", e);
-      }
+  // Flush all remaining batches
+  if (pendingBatches.length > 0) {
+    await flushWithConcurrency(pendingBatches, result);
+  }
 
-      // Invalidate cache after ingestion
-      await invalidateNamespace();
-
-      resolve();
-    });
-
-    stream.on("error", reject);
-  });
+  // Invalidate query cache after ingestion
+  await invalidateNamespace();
 
   return result;
 }
