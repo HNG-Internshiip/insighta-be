@@ -1,4 +1,4 @@
-Stage 4B: System Optimization & Data Ingestion
+# SOLUTION.md — Stage 4B: System Optimization & Data Ingestion
 
 ## Part 1: Query Performance
 
@@ -101,75 +101,94 @@ Without normalization, `gender=male&country_id=NG` and `country_id=NG&gender=mal
 
 ## Part 3: CSV Data Ingestion
 
+### The Serverless Problem
+
+A 500,000-row CSV at 2,000 rows per batch = 250 INSERT statements. At 20ms per round-trip with 5 concurrent inserts, that is ~1 second of pure DB time — but Netlify Functions have a hard 10-second execution limit including network, parsing, and response overhead. A single synchronous Lambda invocation cannot reliably handle 500k rows.
+
+The solution is two modes:
+
+### Two Upload Modes
+
+**Sync mode** (`POST /api/profiles/import`) — default:
+- Processes inline, returns result immediately
+- Safe for files up to ~10,000 rows
+- Works within the 10-second Lambda limit
+
+**Async mode** (`POST /api/profiles/import?async=true`):
+- Receives the file, starts background processing, immediately returns a job ID (202 Accepted)
+- Client polls `GET /api/profiles/import/:jobId` until status is `done` or `failed`
+- Handles files up to 500,000 rows without timeout
+
+This is not overengineering — it is the minimum necessary to handle the stated requirement on a serverless platform. No queue, no worker service, no object storage. The background processing happens in the same Lambda invocation that received the upload, which stays alive until the async work completes.
+
+### Performance Design
+
+**Batch size: 2,000 rows**
+At 9 columns × 2,000 rows = 18,000 parameters — well within PostgreSQL's 65,535 limit. Reduces round-trips from 1,000 (at 500 rows) to 250.
+
+**Concurrency: 5 parallel inserts**
+5 batches × 2,000 rows = 10,000 rows inserted per ~20ms window.
+250 batches ÷ 5 concurrency = 50 sequential windows × 20ms = ~1 second DB time for 500k rows.
+
+**Async generator streaming**
+The `readLines()` function is an async generator that yields lines one at a time from the Node.js stream. No array of all lines is ever held in memory. Peak memory usage is bounded by `BATCH_SIZE × CONCURRENCY × row_size` = ~90MB worst case.
+
+**Backpressure via batch accumulation**
+Batches are accumulated until `CONCURRENCY` batches are ready, then flushed together. This prevents unbounded memory growth if parsing is faster than inserting.
+
 ### Design Decisions
 
-**Streaming, not buffering.** The file is read as a Node.js `Readable` stream via `busboy`. Lines are parsed as they arrive in chunks. At no point is the entire file held in memory. A 500,000-row CSV at ~100 bytes per row is ~50MB — loading this into memory would exhaust Lambda's allocation and block other requests.
+**`ON CONFLICT (name) DO NOTHING`** — idempotency at the database level. Re-uploading the same file is safe and reports duplicates in the summary.
 
-**Chunked batch inserts.** Valid rows are accumulated in a buffer of 500. When the buffer fills, a single `INSERT ... VALUES ($1,...),($2,...),...` statement writes all 500 rows in one database round-trip. This is significantly faster than row-by-row inserts. 500 rows × 9 columns = 4,500 parameters per statement, well within PostgreSQL's limit of 65,535.
+**No rollback on partial failure** — rows already inserted are kept. Rolling back 200,000 committed rows would be more disruptive than keeping them. The response reports exactly what happened.
 
-**Idempotency via `ON CONFLICT DO NOTHING`.** Duplicate names are silently skipped at the database level. This matches the behaviour of the existing seed script and `POST /api/profiles`. Re-uploading the same file does not create duplicates.
+**Single bad row never aborts** — each row validated independently before entering the buffer. Validation errors increment reason counters and are skipped.
 
-**No rollback on partial failure.** If the stream breaks halfway through, rows already inserted are kept. This is intentional — rolling back 200,000 already-committed rows would be more disruptive than keeping them. The response reports exactly what was inserted and what was skipped.
-
-**Single bad row never fails the upload.** Each row is validated independently before being added to the buffer. Invalid rows increment a reason counter and are skipped. The upload continues.
-
-**Stream backpressure.** When a batch insert is executing, the stream is paused (`stream.pause()`) and resumed after the insert completes (`stream.resume()`). This prevents the buffer from growing unboundedly if inserts are slower than the parse rate.
-
-**Cache invalidated after ingestion.** After the upload completes, `invalidateNamespace()` scans and deletes all `profiles:*` Redis keys. Analysts querying immediately after an upload see fresh results.
-
-### Validation Rules
-
-A row is skipped when:
-
-| Condition | Reason code |
-|---|---|
-| Any required field is empty (`name`, `gender`, `age`, `country_id`, `country_name`) | `missing_fields` |
-| `gender` is not `male` or `female` | `invalid_gender` |
-| `age` is not a non-negative integer ≤ 150 | `invalid_age` |
-| `gender_probability` or `country_probability` outside 0–1 | `invalid_gender_probability` / `invalid_country_probability` |
-| Column count does not match header count | `malformed_row` |
-| Name already exists in the database | `duplicate_name` |
-
-`age_group` is not required — if missing or invalid, it is derived from `age` automatically.
+**`age_group` derived if missing** — not a required field. Computed from `age` if absent or invalid, matching the behaviour of all other ingestion paths.
 
 ### API
 
+**Upload (sync — small files):**
 ```
 POST /api/profiles/import
 Authorization: Bearer <admin_token>
 X-API-Version: 1
 Content-Type: multipart/form-data
-
 file: <csv_file>
+
+→ 200 { status, total_rows, inserted, skipped, reasons }
 ```
 
-Response:
-```json
-{
-  "status": "success",
-  "total_rows": 50000,
-  "inserted": 48231,
-  "skipped": 1769,
-  "reasons": {
-    "duplicate_name": 1203,
-    "invalid_age": 312,
-    "missing_fields": 254
-  }
-}
+**Upload (async — large files):**
+```
+POST /api/profiles/import?async=true
+→ 202 { status: "accepted", job_id, poll_url }
 ```
 
-### Concurrency
+**Poll:**
+```
+GET /api/profiles/import/:jobId
+→ 200 { status: "processing" | "done" | "failed", ... }
+```
 
-Multiple uploads can run concurrently. Each upload uses its own stream and its own buffer. Database inserts use the shared connection pool — PostgreSQL handles concurrent `INSERT` statements correctly. The `ON CONFLICT DO NOTHING` clause ensures that concurrent uploads of overlapping data do not cause constraint errors.
+**CSV column spec:**
+```
+name, gender, gender_probability, age, age_group,
+country_id, country_name, country_probability
+```
+`age_group`, `gender_probability`, and `country_probability` are optional.
 
----
+### Validation Rules
 
-## Trade-offs and Limitations
+| Condition | Reason code |
+|---|---|
+| Required field empty (`name`, `gender`, `age`, `country_id`, `country_name`) | `missing_fields` |
+| `gender` not `male` or `female` | `invalid_gender` |
+| `age` not integer 0–150 | `invalid_age` |
+| Probability outside 0–1 | `invalid_gender/country_probability` |
+| Column count ≠ header count | `malformed_row` |
+| Name already in database | `duplicate_name` |
 
-**Redis on Netlify serverless:** Each Lambda invocation creates a new Redis connection. The `redis` client supports persistent TCP connections, but serverless functions don't maintain state between invocations. `connectCache()` is called on every cold start. Warm invocations reuse the existing connection via module-level caching. For sustained traffic, this works. For bursty cold-start scenarios, connection setup adds ~50ms to cache operations. Upstash Redis (HTTP-based) is a better fit for pure serverless — it requires no persistent TCP connection.
+### Concurrency Safety
 
-**CSV line parsing:** The custom CSV parser handles quoted fields and escaped quotes. It does not handle multi-line quoted values (a field containing a newline within quotes). This is an intentional simplification — demographic data fields (names, country names) do not contain newlines in practice.
-
-**Export size:** The export endpoint still loads the full result set into memory before sending. At the current scale this is acceptable. At tens of millions of rows with no filter, a streaming response writer would be needed.
-
-**Rate limiting on ingestion:** The `/api/profiles/import` endpoint is subject to the standard API rate limiter (60 req/min per user). A single large upload counts as one request, so this is not a practical concern. Uploading the same file 60 times in a minute would be rate-limited, which is correct behaviour.
+Multiple uploads run concurrently without conflict. Each has its own stream, buffer, and job record. PostgreSQL's `ON CONFLICT DO NOTHING` handles concurrent uploads of overlapping data without constraint errors — the second insert simply skips the duplicate row.
